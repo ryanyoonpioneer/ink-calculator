@@ -12,7 +12,7 @@ DELTA_E_TOLERANCE = 18
 
 st.info(
     "Gray background is treated as transparent / no ink. "
-    "Tick White only if there is real white ink."
+    "White can be counted as visible white ink and/or white underprint."
 )
 
 color_presets = {
@@ -27,6 +27,18 @@ color_presets = {
     "Pink": "#e91e63",
     "Cyan / Blue-Green": "#00a6b4",
 }
+
+colored_inks = [
+    "Blue",
+    "Green",
+    "Red",
+    "Black",
+    "Yellow",
+    "Orange",
+    "Purple",
+    "Pink",
+    "Cyan / Blue-Green",
+]
 
 st.subheader("1️⃣ Tick actual printed ink colors")
 
@@ -52,6 +64,18 @@ if not selected_colors:
     st.warning("Please tick at least one actual ink color.")
     st.stop()
 
+st.subheader("2️⃣ Printing settings")
+
+gray_is_transparent = st.checkbox(
+    "Gray background is transparent / no ink",
+    value=True,
+)
+
+white_underprint = st.checkbox(
+    "White underprint exists under colored ink",
+    value=True,
+)
+
 uploaded = st.file_uploader("📤 Upload artwork image", type=["png", "jpg", "jpeg"])
 
 if not uploaded:
@@ -67,7 +91,7 @@ if img_bgr is None:
 
 img_rgb_original = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-st.subheader("2️⃣ Original image")
+st.subheader("3️⃣ Original image")
 st.image(img_rgb_original, use_container_width=True)
 
 if not st.button("Calculate Ink Coverage"):
@@ -89,25 +113,16 @@ def hex_to_rgb_float(hex_color):
 
 
 def make_transparent_background_mask(img_rgb):
-    """
-    Treat gray/light gray packaging preview background as transparent/no ink.
-    This avoids counting the gray bag area as white ink.
-    """
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
 
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
-    # Low saturation + medium/high brightness = gray/transparent preview area
-    gray_transparent = (S <= 35) & (V >= 120) & (V <= 245)
-
-    return gray_transparent
+    # Gray/light gray preview background = transparent/no ink
+    return (S <= 35) & (V >= 110) & (V <= 245)
 
 
 def make_basic_family_mask(img_rgb, color_name):
-    """
-    Backup hue-family mask to help catch anti-aliased edges and shaded pixels.
-    """
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
 
     H = hsv[:, :, 0]
@@ -165,7 +180,11 @@ with st.spinner("Calculating ink coverage..."):
     img_rgb_float = img_rgb.astype(np.float32) / 255.0
     img_lab = rgb2lab(img_rgb_float)
 
-    transparent_mask = make_transparent_background_mask(img_rgb)
+    if gray_is_transparent:
+        transparent_mask = make_transparent_background_mask(img_rgb)
+    else:
+        transparent_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
+
     printable_area = ~transparent_mask
 
     priority_order = [
@@ -188,71 +207,126 @@ with st.spinner("Calculating ink coverage..."):
         if color_name not in selected_colors:
             continue
 
-        target_rgb_float = hex_to_rgb_float(selected_colors[color_name])
-        target_lab = rgb2lab(target_rgb_float.reshape(1, 1, 3))[0, 0]
-
-        target_lab_image = np.zeros_like(img_lab)
-        target_lab_image[:, :] = target_lab
-
-        delta_e = deltaE_ciede2000(img_lab, target_lab_image)
-        delta_mask = delta_e <= DELTA_E_TOLERANCE
-
         family_mask = make_basic_family_mask(img_rgb, color_name)
 
         if color_name in ["White", "Black"]:
             color_mask = family_mask
         else:
+            target_rgb_float = hex_to_rgb_float(selected_colors[color_name])
+            target_lab = rgb2lab(target_rgb_float.reshape(1, 1, 3))[0, 0]
+
+            target_lab_image = np.zeros_like(img_lab)
+            target_lab_image[:, :] = target_lab
+
+            delta_e = deltaE_ciede2000(img_lab, target_lab_image)
+            delta_mask = delta_e <= DELTA_E_TOLERANCE
+
             color_mask = delta_mask | family_mask
 
-        # Do not count transparent gray area
         color_mask = color_mask & printable_area
-
-        # Avoid double counting
         color_mask = color_mask & (~assigned)
 
         final_masks[color_name] = color_mask
         assigned |= color_mask
 
-    st.subheader("3️⃣ Ink coverage result")
+    visible_colored_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
+    visible_white_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
+    combined_visible_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
+
+    for color_name, mask in final_masks.items():
+        combined_visible_mask |= mask
+
+        if color_name == "White":
+            visible_white_mask |= mask
+        elif color_name in colored_inks:
+            visible_colored_mask |= mask
+
+    if white_underprint:
+        white_plate_mask = visible_white_mask | visible_colored_mask
+    else:
+        white_plate_mask = visible_white_mask
+
+    visible_colored_percent = np.sum(visible_colored_mask) / total_pixels * 100
+    visible_white_percent = np.sum(visible_white_mask) / total_pixels * 100
+    white_plate_percent = np.sum(white_plate_mask) / total_pixels * 100
+    total_visible_percent = np.sum(combined_visible_mask) / total_pixels * 100
+
+    # Total ink laydown means each plate counted separately.
+    # Example: blue 20% + white underprint 20% = 40% total ink laydown.
+    total_ink_laydown_percent = visible_colored_percent + white_plate_percent
+
+    st.subheader("4️⃣ Ink coverage result")
 
     results = []
-    combined_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
 
     for color_name, mask in final_masks.items():
         pixels = int(np.sum(mask))
         percent = pixels / total_pixels * 100
 
-        combined_mask |= mask
-
         results.append(
             {
-                "Ink Color": color_name,
-                "Coverage %": round(percent, 2),
+                "Ink / Plate": color_name,
+                "Visible Coverage %": round(percent, 2),
                 "Pixels Counted": pixels,
                 "Sample HEX": selected_colors[color_name],
             }
         )
 
-    total_selected = np.sum(combined_mask) / total_pixels * 100
-
-    st.success(f"🎯 Total selected ink coverage: {total_selected:.2f}%")
+    if white_underprint:
+        results.append(
+            {
+                "Ink / Plate": "White Plate incl. underprint",
+                "Visible Coverage %": round(white_plate_percent, 2),
+                "Pixels Counted": int(np.sum(white_plate_mask)),
+                "Sample HEX": "#ffffff",
+            }
+        )
 
     st.dataframe(pd.DataFrame(results), use_container_width=True)
 
-    combined_mask_full = cv2.resize(
-        combined_mask.astype(np.uint8),
+    st.success(f"Visible printed area: {total_visible_percent:.2f}%")
+    st.success(f"White plate coverage: {white_plate_percent:.2f}%")
+    st.success(f"Total ink laydown estimate: {total_ink_laydown_percent:.2f}%")
+
+    st.caption(
+        "Visible printed area counts each pixel once. "
+        "Total ink laydown counts separate ink layers, including white underprint."
+    )
+
+    combined_visible_mask_full = cv2.resize(
+        combined_visible_mask.astype(np.uint8),
         (img_rgb_original.shape[1], img_rgb_original.shape[0]),
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
 
-    st.subheader("4️⃣ Selected ink preview")
+    white_plate_mask_full = cv2.resize(
+        white_plate_mask.astype(np.uint8),
+        (img_rgb_original.shape[1], img_rgb_original.shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    ).astype(bool)
+
+    transparent_mask_full = cv2.resize(
+        transparent_mask.astype(np.uint8),
+        (img_rgb_original.shape[1], img_rgb_original.shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    ).astype(bool)
+
+    st.subheader("5️⃣ Selected visible ink preview")
 
     selected_preview = img_rgb_original.copy()
-    selected_preview[~combined_mask_full] = [225, 225, 225]
+    selected_preview[~combined_visible_mask_full] = [225, 225, 225]
 
     st.image(selected_preview, use_container_width=True)
 
-    st.subheader("5️⃣ Clean detection preview")
+    st.subheader("6️⃣ White plate / underprint preview")
+
+    white_preview = np.full_like(img_rgb_original, 225)
+    white_preview[white_plate_mask_full] = [255, 255, 255]
+    white_preview[transparent_mask_full] = [180, 180, 180]
+
+    st.image(white_preview, use_container_width=True)
+
+    st.subheader("7️⃣ Clean detection preview")
 
     preview_colors = {
         "White": [255, 255, 255],
@@ -278,8 +352,11 @@ with st.spinner("Calculating ink coverage..."):
 
         clean_preview[mask_full] = preview_colors[color_name]
 
+    clean_preview[transparent_mask_full] = [180, 180, 180]
+
     st.image(clean_preview, use_container_width=True)
 
 st.info(
-    "This version uses CIEDE2000 Delta E color matching, which is better for color accuracy than HSV/RGB matching."
+    "For transparent CPP/PE film: gray = no ink. "
+    "White underprint means white is counted under colored ink areas too."
 )
