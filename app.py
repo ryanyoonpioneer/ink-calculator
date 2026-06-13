@@ -119,7 +119,7 @@ def make_transparent_background_mask(img_rgb):
     V = hsv[:, :, 2]
 
     # Gray/light gray preview background = transparent/no ink
-    return (S <= 35) & (V >= 110) & (V <= 245)
+    return (S <= 30) & (V >= 120) & (V <= 210)
 
 
 def make_basic_family_mask(img_rgb, color_name):
