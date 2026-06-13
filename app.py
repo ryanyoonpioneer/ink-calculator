@@ -191,7 +191,10 @@ with st.spinner("Calculating ink coverage..."):
         target_rgb_float = hex_to_rgb_float(selected_colors[color_name])
         target_lab = rgb2lab(target_rgb_float.reshape(1, 1, 3))[0, 0]
 
-        delta_e = deltaE_ciede2000(img_lab, target_lab)
+        target_lab_image = np.zeros_like(img_lab)
+        target_lab_image[:, :] = target_lab
+
+        delta_e = deltaE_ciede2000(img_lab, target_lab_image)
         delta_mask = delta_e <= DELTA_E_TOLERANCE
 
         family_mask = make_basic_family_mask(img_rgb, color_name)
