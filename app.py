@@ -11,8 +11,8 @@ MAX_PIXELS = 300000
 DELTA_E_TOLERANCE = 18
 
 st.info(
-    "Gray background is treated as transparent / no ink. "
-    "White can be counted as visible white ink and/or white underprint."
+    "For transparent CPP/PE film: gray usually means transparent/no ink. "
+    "White ink can be counted as visible white, underprint under colors, or full white backing."
 )
 
 color_presets = {
@@ -40,6 +40,9 @@ colored_inks = [
     "Cyan / Blue-Green",
 ]
 
+# =========================
+# 1. Select inks
+# =========================
 st.subheader("1️⃣ Tick actual printed ink colors")
 
 selected_colors = {}
@@ -64,6 +67,9 @@ if not selected_colors:
     st.warning("Please tick at least one actual ink color.")
     st.stop()
 
+# =========================
+# 2. Printing settings
+# =========================
 st.subheader("2️⃣ Printing settings")
 
 gray_is_transparent = st.checkbox(
@@ -74,6 +80,20 @@ gray_is_transparent = st.checkbox(
 white_underprint = st.checkbox(
     "White underprint exists under colored ink",
     value=True,
+)
+
+white_backing_mode = st.radio(
+    "White plate calculation method",
+    [
+        "Visible white + underprint under colored ink",
+        "Full white backing behind white panels / label areas",
+    ],
+    index=1,
+)
+
+st.caption(
+    "Use full white backing when the white plate covers the whole label/panel area, "
+    "not just the visible white pixels."
 )
 
 uploaded = st.file_uploader("📤 Upload artwork image", type=["png", "jpg", "jpeg"])
@@ -99,6 +119,9 @@ if not st.button("Calculate Ink Coverage"):
     st.stop()
 
 
+# =========================
+# Helper functions
+# =========================
 def hex_to_rgb_float(hex_color):
     hex_color = hex_color.replace("#", "")
     rgb = np.array(
@@ -118,8 +141,46 @@ def make_transparent_background_mask(img_rgb):
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
-    # Gray/light gray preview background = transparent/no ink
-    return (S <= 30) & (V >= 120) & (V <= 210)
+    # Medium gray = transparent preview area.
+    # Do not remove near-white panels.
+    return (S <= 35) & (V >= 95) & (V <= 225)
+
+
+def make_visible_white_mask(img_rgb):
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+
+    S = hsv[:, :, 1]
+    V = hsv[:, :, 2]
+
+    # Strict white only
+    return (S <= 22) & (V >= 245)
+
+
+def make_white_panel_backing_mask(img_rgb, transparent_mask):
+    """
+    Detect full white label/panel areas:
+    - white or near-white panels
+    - excludes medium gray transparent background
+    - closes small text gaps so the panel becomes a solid backing area
+    """
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+
+    S = hsv[:, :, 1]
+    V = hsv[:, :, 2]
+
+    near_white = (S <= 38) & (V >= 225)
+    panel_mask = near_white & (~transparent_mask)
+
+    # Morphological closing to fill holes created by text/blue marks inside white panels
+    panel_u8 = panel_mask.astype(np.uint8) * 255
+
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    panel_u8 = cv2.morphologyEx(panel_u8, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    panel_u8 = cv2.morphologyEx(panel_u8, cv2.MORPH_OPEN, kernel_open, iterations=1)
+
+    return panel_u8 > 0
 
 
 def make_basic_family_mask(img_rgb, color_name):
@@ -130,7 +191,7 @@ def make_basic_family_mask(img_rgb, color_name):
     V = hsv[:, :, 2]
 
     if color_name == "White":
-        return (S <= 18) & (V >= 248)
+        return make_visible_white_mask(img_rgb)
 
     if color_name == "Black":
         return V <= 60
@@ -162,6 +223,9 @@ def make_basic_family_mask(img_rgb, color_name):
     return np.zeros(img_rgb.shape[:2], dtype=bool)
 
 
+# =========================
+# Main calculation
+# =========================
 with st.spinner("Calculating ink coverage..."):
     h, w = img_rgb_original.shape[:2]
     scale = min(1.0, (MAX_PIXELS / (h * w)) ** 0.5)
@@ -241,20 +305,28 @@ with st.spinner("Calculating ink coverage..."):
         elif color_name in colored_inks:
             visible_colored_mask |= mask
 
-    if white_underprint:
-        white_plate_mask = visible_white_mask | visible_colored_mask
+    # White plate logic
+    if "Full white backing behind white panels / label areas" in white_backing_mode:
+        white_panel_backing_mask = make_white_panel_backing_mask(img_rgb, transparent_mask)
     else:
-        white_plate_mask = visible_white_mask
+        white_panel_backing_mask = visible_white_mask
+
+    if white_underprint:
+        white_plate_mask = white_panel_backing_mask | visible_colored_mask
+    else:
+        white_plate_mask = white_panel_backing_mask
 
     visible_colored_percent = np.sum(visible_colored_mask) / total_pixels * 100
     visible_white_percent = np.sum(visible_white_mask) / total_pixels * 100
+    white_backing_percent = np.sum(white_panel_backing_mask) / total_pixels * 100
     white_plate_percent = np.sum(white_plate_mask) / total_pixels * 100
     total_visible_percent = np.sum(combined_visible_mask) / total_pixels * 100
 
-    # Total ink laydown means each plate counted separately.
-    # Example: blue 20% + white underprint 20% = 40% total ink laydown.
     total_ink_laydown_percent = visible_colored_percent + white_plate_percent
 
+    # =========================
+    # Results
+    # =========================
     st.subheader("4️⃣ Ink coverage result")
 
     results = []
@@ -266,17 +338,26 @@ with st.spinner("Calculating ink coverage..."):
         results.append(
             {
                 "Ink / Plate": color_name,
-                "Visible Coverage %": round(percent, 2),
+                "Coverage %": round(percent, 2),
                 "Pixels Counted": pixels,
                 "Sample HEX": selected_colors[color_name],
             }
         )
 
+    results.append(
+        {
+            "Ink / Plate": "White backing/panel area",
+            "Coverage %": round(white_backing_percent, 2),
+            "Pixels Counted": int(np.sum(white_panel_backing_mask)),
+            "Sample HEX": "#ffffff",
+        }
+    )
+
     if white_underprint:
         results.append(
             {
-                "Ink / Plate": "White Plate incl. underprint",
-                "Visible Coverage %": round(white_plate_percent, 2),
+                "Ink / Plate": "White plate incl. underprint",
+                "Coverage %": round(white_plate_percent, 2),
                 "Pixels Counted": int(np.sum(white_plate_mask)),
                 "Sample HEX": "#ffffff",
             }
@@ -289,10 +370,13 @@ with st.spinner("Calculating ink coverage..."):
     st.success(f"Total ink laydown estimate: {total_ink_laydown_percent:.2f}%")
 
     st.caption(
-        "Visible printed area counts each pixel once. "
-        "Total ink laydown counts separate ink layers, including white underprint."
+        "White backing/panel area = full white backing behind detected white label/panel zones. "
+        "White plate incl. underprint = white backing/panel area plus underprint beneath colored inks."
     )
 
+    # =========================
+    # Full resolution preview masks
+    # =========================
     combined_visible_mask_full = cv2.resize(
         combined_visible_mask.astype(np.uint8),
         (img_rgb_original.shape[1], img_rgb_original.shape[0]),
@@ -305,12 +389,21 @@ with st.spinner("Calculating ink coverage..."):
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
 
+    white_panel_backing_mask_full = cv2.resize(
+        white_panel_backing_mask.astype(np.uint8),
+        (img_rgb_original.shape[1], img_rgb_original.shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    ).astype(bool)
+
     transparent_mask_full = cv2.resize(
         transparent_mask.astype(np.uint8),
         (img_rgb_original.shape[1], img_rgb_original.shape[0]),
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
 
+    # =========================
+    # Previews
+    # =========================
     st.subheader("5️⃣ Selected visible ink preview")
 
     selected_preview = img_rgb_original.copy()
@@ -318,15 +411,23 @@ with st.spinner("Calculating ink coverage..."):
 
     st.image(selected_preview, use_container_width=True)
 
-    st.subheader("6️⃣ White plate / underprint preview")
+    st.subheader("6️⃣ White backing / panel preview")
 
-    white_preview = np.full_like(img_rgb_original, 225)
-    white_preview[white_plate_mask_full] = [255, 255, 255]
-    white_preview[transparent_mask_full] = [180, 180, 180]
+    backing_preview = np.full_like(img_rgb_original, 225)
+    backing_preview[white_panel_backing_mask_full] = [255, 255, 255]
+    backing_preview[transparent_mask_full] = [180, 180, 180]
 
-    st.image(white_preview, use_container_width=True)
+    st.image(backing_preview, use_container_width=True)
 
-    st.subheader("7️⃣ Clean detection preview")
+    st.subheader("7️⃣ White plate incl. underprint preview")
+
+    white_plate_preview = np.full_like(img_rgb_original, 225)
+    white_plate_preview[white_plate_mask_full] = [255, 255, 255]
+    white_plate_preview[transparent_mask_full] = [180, 180, 180]
+
+    st.image(white_plate_preview, use_container_width=True)
+
+    st.subheader("8️⃣ Clean detection preview")
 
     preview_colors = {
         "White": [255, 255, 255],
@@ -357,6 +458,6 @@ with st.spinner("Calculating ink coverage..."):
     st.image(clean_preview, use_container_width=True)
 
 st.info(
-    "For transparent CPP/PE film: gray = no ink. "
-    "White underprint means white is counted under colored ink areas too."
+    "Check the white plate preview. If it matches the areas where the white cylinder prints, "
+    "use that white plate % for white ink consumption."
 )
