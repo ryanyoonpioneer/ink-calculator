@@ -8,116 +8,12 @@ st.set_page_config(page_title="Ink Coverage Calculator", layout="centered")
 st.title("🎨 Ink Coverage Calculator")
 
 MAX_PIXELS = 300000
-DELTA_E_TOLERANCE = 18
+AUTO_COLOR_COUNT = 6
 
 st.info(
-    "For transparent CPP/PE film: gray usually means transparent/no ink. "
-    "White ink can be counted as visible white, underprint under colors, or full white backing."
+    "Ink % is based on selected print colors. Gray can be treated as transparent/no ink. "
+    "White underprint and white backing are calculated separately."
 )
-
-color_presets = {
-    "Blue": "#1f2f8f",
-    "Green": "#007a5a",
-    "Red": "#d71920",
-    "White": "#ffffff",
-    "Black": "#000000",
-    "Yellow": "#ffd200",
-    "Orange": "#f58220",
-    "Purple": "#6a1b9a",
-    "Pink": "#e91e63",
-    "Cyan / Blue-Green": "#00a6b4",
-}
-
-colored_inks = [
-    "Blue",
-    "Green",
-    "Red",
-    "Black",
-    "Yellow",
-    "Orange",
-    "Purple",
-    "Pink",
-    "Cyan / Blue-Green",
-]
-
-# =========================
-# 1. Select inks
-# =========================
-st.subheader("1️⃣ Tick actual printed ink colors")
-
-selected_colors = {}
-cols = st.columns(3)
-
-for i, (color_name, default_hex) in enumerate(color_presets.items()):
-    with cols[i % 3]:
-        checked = st.checkbox(
-            color_name,
-            value=False,
-            key=f"check_{color_name}",
-        )
-
-        if checked:
-            selected_colors[color_name] = st.color_picker(
-                f"{color_name} sample",
-                default_hex,
-                key=f"picker_{color_name}",
-            )
-
-if not selected_colors:
-    st.warning("Please tick at least one actual ink color.")
-    st.stop()
-
-# =========================
-# 2. Printing settings
-# =========================
-st.subheader("2️⃣ Printing settings")
-
-gray_is_transparent = st.checkbox(
-    "Gray background is transparent / no ink",
-    value=True,
-)
-
-white_underprint = st.checkbox(
-    "White underprint exists under colored ink",
-    value=True,
-)
-
-white_backing_mode = st.radio(
-    "White plate calculation method",
-    [
-        "Visible white + underprint under colored ink",
-        "Full white backing behind white panels / label areas",
-    ],
-    index=1,
-)
-
-st.caption(
-    "Use full white backing when the white plate covers the whole label/panel area, "
-    "not just the visible white pixels."
-)
-
-uploaded = st.file_uploader("📤 Upload artwork image", type=["png", "jpg", "jpeg"])
-
-if not uploaded:
-    st.info("Upload artwork after selecting the ink colors.")
-    st.stop()
-
-img_bytes = uploaded.read()
-img_bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-
-if img_bgr is None:
-    st.error("Could not read image.")
-    st.stop()
-
-img_rgb_original = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-st.subheader("3️⃣ Original image")
-st.image(img_rgb_original, use_container_width=True)
-
-if not st.button("Calculate Ink Coverage"):
-    st.info("Click Calculate after uploading the image.")
-    st.stop()
-
 
 # =========================
 # Helper functions
@@ -135,46 +31,88 @@ def hex_to_rgb_float(hex_color):
     return rgb / 255.0
 
 
-def make_transparent_background_mask(img_rgb):
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+def rgb_to_hex(rgb):
+    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    return "#{:02x}{:02x}{:02x}".format(rgb[0], rgb[1], rgb[2])
 
+
+def approximate_color_name(rgb):
+    sample = np.uint8([[rgb]])
+    hsv = cv2.cvtColor(sample, cv2.COLOR_RGB2HSV)[0, 0]
+    h, s, v = hsv
+
+    if s <= 25 and v >= 245:
+        return "White"
+    if v <= 60:
+        return "Black"
+    if s <= 45:
+        return "Gray"
+    if h <= 12 or h >= 168:
+        return "Red"
+    if h <= 24:
+        return "Orange"
+    if h <= 38:
+        return "Yellow"
+    if h <= 88:
+        return "Green"
+    if h <= 100:
+        return "Cyan / Blue-Green"
+    if h <= 140:
+        return "Blue"
+    if h <= 158:
+        return "Purple"
+    return "Pink"
+
+
+def resize_for_analysis(img_rgb):
+    h, w = img_rgb.shape[:2]
+    scale = min(1.0, (MAX_PIXELS / (h * w)) ** 0.5)
+
+    if scale < 1.0:
+        return cv2.resize(
+            img_rgb,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    return img_rgb.copy()
+
+
+def make_transparent_mask(img_rgb, mode):
+    if mode == "No transparent areas":
+        return np.zeros(img_rgb.shape[:2], dtype=bool)
+
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
-    # Medium gray = transparent preview area.
-    # Do not remove near-white panels.
-    return (S <= 35) & (V >= 95) & (V <= 225)
+    if mode == "Gray = transparent":
+        return (S <= 35) & (V >= 95) & (V <= 225)
+
+    # Auto detect transparent gray
+    return (S <= 35) & (V >= 100) & (V <= 230)
 
 
-def make_visible_white_mask(img_rgb):
+def make_visible_white_mask(img_rgb, transparent_mask):
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
-    # Strict white only
-    return (S <= 22) & (V >= 245)
+    white = (S <= 22) & (V >= 245)
+    return white & (~transparent_mask)
 
 
 def make_white_panel_backing_mask(img_rgb, transparent_mask):
-    """
-    Detect full white label/panel areas:
-    - white or near-white panels
-    - excludes medium gray transparent background
-    - closes small text gaps so the panel becomes a solid backing area
-    """
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-
     S = hsv[:, :, 1]
     V = hsv[:, :, 2]
 
-    near_white = (S <= 38) & (V >= 225)
+    near_white = (S <= 40) & (V >= 225)
     panel_mask = near_white & (~transparent_mask)
 
-    # Morphological closing to fill holes created by text/blue marks inside white panels
     panel_u8 = panel_mask.astype(np.uint8) * 255
 
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
     panel_u8 = cv2.morphologyEx(panel_u8, cv2.MORPH_CLOSE, kernel_close, iterations=2)
 
     kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -183,281 +121,394 @@ def make_white_panel_backing_mask(img_rgb, transparent_mask):
     return panel_u8 > 0
 
 
-def make_basic_family_mask(img_rgb, color_name):
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+def auto_detect_colors(img_rgb, transparent_mask, k=AUTO_COLOR_COUNT):
+    valid_pixels = img_rgb[~transparent_mask]
 
-    H = hsv[:, :, 0]
-    S = hsv[:, :, 1]
-    V = hsv[:, :, 2]
+    if len(valid_pixels) < 100:
+        valid_pixels = img_rgb.reshape(-1, 3)
 
-    if color_name == "White":
-        return make_visible_white_mask(img_rgb)
+    pixels = valid_pixels.astype(np.float32)
 
-    if color_name == "Black":
-        return V <= 60
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        40,
+        0.2,
+    )
 
-    if color_name == "Red":
-        return ((H <= 12) | (H >= 168)) & (S >= 40) & (V >= 45)
+    _, labels, centers = cv2.kmeans(
+        pixels,
+        k,
+        None,
+        criteria,
+        5,
+        cv2.KMEANS_PP_CENTERS,
+    )
 
-    if color_name == "Orange":
-        return (H > 12) & (H <= 24) & (S >= 40) & (V >= 45)
+    centers = centers.astype(np.uint8)
+    counts = np.bincount(labels.flatten(), minlength=k)
+    percents = counts / counts.sum() * 100
 
-    if color_name == "Yellow":
-        return (H > 24) & (H <= 38) & (S >= 40) & (V >= 45)
+    detected = []
 
-    if color_name == "Green":
-        return (H > 38) & (H <= 88) & (S >= 30) & (V >= 35)
+    for i in range(k):
+        rgb = centers[i]
+        detected.append(
+            {
+                "name": approximate_color_name(rgb),
+                "hex": rgb_to_hex(rgb),
+                "percent": float(percents[i]),
+                "rgb": rgb,
+            }
+        )
 
-    if color_name == "Cyan / Blue-Green":
-        return (H > 88) & (H <= 100) & (S >= 30) & (V >= 35)
+    detected.sort(key=lambda x: x["percent"], reverse=True)
+    return detected
 
-    if color_name == "Blue":
-        return (H > 100) & (H <= 140) & (S >= 30) & (V >= 35)
 
-    if color_name == "Purple":
-        return (H > 140) & (H <= 158) & (S >= 35) & (V >= 45)
+def assign_pixels_to_nearest_ink(img_rgb, selected_colors, printable_area):
+    img_float = img_rgb.astype(np.float32) / 255.0
+    img_lab = rgb2lab(img_float)
 
-    if color_name == "Pink":
-        return (H > 158) & (H < 168) & (S >= 35) & (V >= 45)
+    ink_names = list(selected_colors.keys())
+    distance_stack = []
 
-    return np.zeros(img_rgb.shape[:2], dtype=bool)
+    for ink in ink_names:
+        target_rgb = hex_to_rgb_float(selected_colors[ink])
+        target_lab = rgb2lab(target_rgb.reshape(1, 1, 3))[0, 0]
+
+        target_lab_image = np.zeros_like(img_lab)
+        target_lab_image[:, :] = target_lab
+
+        delta_e = deltaE_ciede2000(img_lab, target_lab_image)
+        distance_stack.append(delta_e)
+
+    distance_stack = np.stack(distance_stack, axis=0)
+
+    nearest_index = np.argmin(distance_stack, axis=0)
+
+    masks = {}
+
+    for i, ink in enumerate(ink_names):
+        masks[ink] = (nearest_index == i) & printable_area
+
+    return masks
 
 
 # =========================
-# Main calculation
+# Upload image first
+# =========================
+uploaded = st.file_uploader("📤 Upload artwork image", type=["png", "jpg", "jpeg"])
+
+if not uploaded:
+    st.info("Upload artwork image first.")
+    st.stop()
+
+img_bytes = uploaded.read()
+img_bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+
+if img_bgr is None:
+    st.error("Could not read image.")
+    st.stop()
+
+img_rgb_original = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+img_rgb = resize_for_analysis(img_rgb_original)
+
+st.subheader("1️⃣ Original image")
+st.image(img_rgb_original, use_container_width=True)
+
+# =========================
+# Settings
+# =========================
+st.subheader("2️⃣ Transparent area setting")
+
+transparent_mode = st.radio(
+    "How should gray areas be treated?",
+    [
+        "Gray = transparent",
+        "No transparent areas",
+        "Auto detect transparent gray",
+    ],
+    index=0,
+)
+
+transparent_mask = make_transparent_mask(img_rgb, transparent_mode)
+printable_area = ~transparent_mask
+
+# =========================
+# Color selection mode
+# =========================
+st.subheader("3️⃣ Color selection method")
+
+selection_mode = st.radio(
+    "Choose method",
+    [
+        "Manual: tick actual ink colors",
+        "Auto-detect: program finds main colors",
+    ],
+    index=0,
+)
+
+selected_colors = {}
+
+preset_colors = {
+    "White": "#ffffff",
+    "Black": "#000000",
+    "Gray": "#777777",
+    "Blue": "#1f2f8f",
+    "Green": "#007a5a",
+    "Red": "#d71920",
+    "Yellow": "#ffd200",
+    "Orange": "#f58220",
+    "Purple": "#6a1b9a",
+    "Pink": "#e91e63",
+    "Cyan / Blue-Green": "#00a6b4",
+}
+
+if selection_mode == "Manual: tick actual ink colors":
+    st.write("Tick only actual printing inks.")
+
+    cols = st.columns(3)
+
+    for i, (color_name, default_hex) in enumerate(preset_colors.items()):
+        with cols[i % 3]:
+            checked = st.checkbox(
+                color_name,
+                value=False,
+                key=f"manual_{color_name}",
+            )
+
+            if checked:
+                selected_colors[color_name] = st.color_picker(
+                    f"{color_name} sample",
+                    default_hex,
+                    key=f"picker_manual_{color_name}",
+                )
+
+else:
+    detected_colors = auto_detect_colors(img_rgb, transparent_mask, AUTO_COLOR_COUNT)
+
+    st.write(f"Program detected **{len(detected_colors)} main colors**. Untick colors that are not ink.")
+
+    for i, color in enumerate(detected_colors):
+        label = f"{color['name']} {color['hex']} — approx {color['percent']:.1f}%"
+
+        col1, col2 = st.columns([1, 5])
+
+        with col1:
+            st.markdown(
+                f"""
+                <div style="
+                    width:34px;
+                    height:34px;
+                    background:{color['hex']};
+                    border:1px solid #000;
+                    border-radius:4px;">
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        with col2:
+            checked = st.checkbox(
+                label,
+                value=color["name"] != "Gray",
+                key=f"auto_check_{i}",
+            )
+
+            if checked:
+                ink_name = f"{color['name']} #{i + 1}"
+                selected_colors[ink_name] = st.color_picker(
+                    f"Adjust {ink_name}",
+                    color["hex"],
+                    key=f"auto_picker_{i}",
+                )
+
+if not selected_colors:
+    st.warning("Please select at least one ink color.")
+    st.stop()
+
+# =========================
+# White settings
+# =========================
+st.subheader("4️⃣ White ink settings")
+
+white_underprint = st.checkbox(
+    "White underprint exists under colored inks",
+    value=True,
+)
+
+white_backing_mode = st.radio(
+    "White plate method",
+    [
+        "Visible white only",
+        "Visible white + underprint under colored ink",
+        "Full white backing behind white panels / label areas",
+    ],
+    index=2,
+)
+
+st.caption(
+    "For transparent CPP/PE/OPP, white usually prints under colored areas. "
+    "Use full white backing when white label panels are printed as solid white blocks."
+)
+
+if not st.button("Calculate Ink Coverage"):
+    st.info("Click Calculate after checking the colors and white settings.")
+    st.stop()
+
+# =========================
+# Calculate
 # =========================
 with st.spinner("Calculating ink coverage..."):
-    h, w = img_rgb_original.shape[:2]
-    scale = min(1.0, (MAX_PIXELS / (h * w)) ** 0.5)
-
-    if scale < 1.0:
-        img_rgb = cv2.resize(
-            img_rgb_original,
-            (int(w * scale), int(h * scale)),
-            interpolation=cv2.INTER_AREA,
-        )
-    else:
-        img_rgb = img_rgb_original.copy()
-
     total_pixels = img_rgb.shape[0] * img_rgb.shape[1]
 
-    img_rgb_float = img_rgb.astype(np.float32) / 255.0
-    img_lab = rgb2lab(img_rgb_float)
+    assigned_masks = assign_pixels_to_nearest_ink(
+        img_rgb,
+        selected_colors,
+        printable_area,
+    )
 
-    if gray_is_transparent:
-        transparent_mask = make_transparent_background_mask(img_rgb)
-    else:
-        transparent_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
-
-    printable_area = ~transparent_mask
-
-    priority_order = [
-        "Black",
-        "White",
-        "Red",
-        "Orange",
-        "Yellow",
-        "Green",
-        "Cyan / Blue-Green",
-        "Blue",
-        "Purple",
-        "Pink",
-    ]
-
-    assigned = np.zeros(img_rgb.shape[:2], dtype=bool)
-    final_masks = {}
-
-    for color_name in priority_order:
-        if color_name not in selected_colors:
-            continue
-
-        family_mask = make_basic_family_mask(img_rgb, color_name)
-
-        if color_name in ["White", "Black"]:
-            color_mask = family_mask
-        else:
-            target_rgb_float = hex_to_rgb_float(selected_colors[color_name])
-            target_lab = rgb2lab(target_rgb_float.reshape(1, 1, 3))[0, 0]
-
-            target_lab_image = np.zeros_like(img_lab)
-            target_lab_image[:, :] = target_lab
-
-            delta_e = deltaE_ciede2000(img_lab, target_lab_image)
-            delta_mask = delta_e <= DELTA_E_TOLERANCE
-
-            color_mask = delta_mask | family_mask
-
-        color_mask = color_mask & printable_area
-        color_mask = color_mask & (~assigned)
-
-        final_masks[color_name] = color_mask
-        assigned |= color_mask
-
-    visible_colored_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
     visible_white_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
+    visible_colored_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
     combined_visible_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
 
-    for color_name, mask in final_masks.items():
+    for ink, mask in assigned_masks.items():
         combined_visible_mask |= mask
 
-        if color_name == "White":
+        if "White" in ink:
             visible_white_mask |= mask
-        elif color_name in colored_inks:
+        else:
             visible_colored_mask |= mask
 
-    # White plate logic
-    if "Full white backing behind white panels / label areas" in white_backing_mode:
-        white_panel_backing_mask = make_white_panel_backing_mask(img_rgb, transparent_mask)
-    else:
-        white_panel_backing_mask = visible_white_mask
+    strict_visible_white_mask = make_visible_white_mask(img_rgb, transparent_mask)
 
-    if white_underprint:
-        white_plate_mask = white_panel_backing_mask | visible_colored_mask
+    if white_backing_mode == "Visible white only":
+        white_plate_mask = strict_visible_white_mask
+
+    elif white_backing_mode == "Visible white + underprint under colored ink":
+        if white_underprint:
+            white_plate_mask = strict_visible_white_mask | visible_colored_mask
+        else:
+            white_plate_mask = strict_visible_white_mask
+
     else:
-        white_plate_mask = white_panel_backing_mask
+        white_panel_backing_mask = make_white_panel_backing_mask(img_rgb, transparent_mask)
+
+        if white_underprint:
+            white_plate_mask = white_panel_backing_mask | visible_colored_mask
+        else:
+            white_plate_mask = white_panel_backing_mask
 
     visible_colored_percent = np.sum(visible_colored_mask) / total_pixels * 100
-    visible_white_percent = np.sum(visible_white_mask) / total_pixels * 100
-    white_backing_percent = np.sum(white_panel_backing_mask) / total_pixels * 100
     white_plate_percent = np.sum(white_plate_mask) / total_pixels * 100
     total_visible_percent = np.sum(combined_visible_mask) / total_pixels * 100
+    total_ink_laydown = visible_colored_percent + white_plate_percent
 
-    total_ink_laydown_percent = visible_colored_percent + white_plate_percent
-
-    # =========================
-    # Results
-    # =========================
-    st.subheader("4️⃣ Ink coverage result")
+    st.subheader("5️⃣ Ink coverage result")
 
     results = []
 
-    for color_name, mask in final_masks.items():
-        pixels = int(np.sum(mask))
-        percent = pixels / total_pixels * 100
+    for ink, mask in assigned_masks.items():
+        percent = np.sum(mask) / total_pixels * 100
 
         results.append(
             {
-                "Ink / Plate": color_name,
+                "Ink / Plate": ink,
                 "Coverage %": round(percent, 2),
-                "Pixels Counted": pixels,
-                "Sample HEX": selected_colors[color_name],
+                "Pixels Counted": int(np.sum(mask)),
+                "Sample HEX": selected_colors[ink],
             }
         )
 
     results.append(
         {
-            "Ink / Plate": "White backing/panel area",
-            "Coverage %": round(white_backing_percent, 2),
-            "Pixels Counted": int(np.sum(white_panel_backing_mask)),
+            "Ink / Plate": "White plate final",
+            "Coverage %": round(white_plate_percent, 2),
+            "Pixels Counted": int(np.sum(white_plate_mask)),
             "Sample HEX": "#ffffff",
         }
     )
 
-    if white_underprint:
-        results.append(
-            {
-                "Ink / Plate": "White plate incl. underprint",
-                "Coverage %": round(white_plate_percent, 2),
-                "Pixels Counted": int(np.sum(white_plate_mask)),
-                "Sample HEX": "#ffffff",
-            }
-        )
-
-    st.dataframe(pd.DataFrame(results), use_container_width=True)
+    df = pd.DataFrame(results)
+    st.dataframe(df, use_container_width=True)
 
     st.success(f"Visible printed area: {total_visible_percent:.2f}%")
     st.success(f"White plate coverage: {white_plate_percent:.2f}%")
-    st.success(f"Total ink laydown estimate: {total_ink_laydown_percent:.2f}%")
+    st.success(f"Total ink laydown estimate: {total_ink_laydown:.2f}%")
 
     st.caption(
-        "White backing/panel area = full white backing behind detected white label/panel zones. "
-        "White plate incl. underprint = white backing/panel area plus underprint beneath colored inks."
+        "Use individual plate % for each ink. Use total ink laydown only for overall ink-load comparison."
     )
 
     # =========================
-    # Full resolution preview masks
+    # Full-resolution previews
     # =========================
-    combined_visible_mask_full = cv2.resize(
+    combined_visible_full = cv2.resize(
         combined_visible_mask.astype(np.uint8),
         (img_rgb_original.shape[1], img_rgb_original.shape[0]),
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
 
-    white_plate_mask_full = cv2.resize(
+    white_plate_full = cv2.resize(
         white_plate_mask.astype(np.uint8),
         (img_rgb_original.shape[1], img_rgb_original.shape[0]),
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
 
-    white_panel_backing_mask_full = cv2.resize(
-        white_panel_backing_mask.astype(np.uint8),
-        (img_rgb_original.shape[1], img_rgb_original.shape[0]),
-        interpolation=cv2.INTER_NEAREST,
-    ).astype(bool)
-
-    transparent_mask_full = cv2.resize(
+    transparent_full = cv2.resize(
         transparent_mask.astype(np.uint8),
         (img_rgb_original.shape[1], img_rgb_original.shape[0]),
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
 
-    # =========================
-    # Previews
-    # =========================
-    st.subheader("5️⃣ Selected visible ink preview")
+    st.subheader("6️⃣ Selected printable ink preview")
 
     selected_preview = img_rgb_original.copy()
-    selected_preview[~combined_visible_mask_full] = [225, 225, 225]
+    selected_preview[~combined_visible_full] = [225, 225, 225]
+    selected_preview[transparent_full] = [180, 180, 180]
 
     st.image(selected_preview, use_container_width=True)
 
-    st.subheader("6️⃣ White backing / panel preview")
+    st.subheader("7️⃣ White plate preview")
 
-    backing_preview = np.full_like(img_rgb_original, 225)
-    backing_preview[white_panel_backing_mask_full] = [255, 255, 255]
-    backing_preview[transparent_mask_full] = [180, 180, 180]
+    white_preview = np.full_like(img_rgb_original, 225)
+    white_preview[white_plate_full] = [255, 255, 255]
+    white_preview[transparent_full] = [180, 180, 180]
 
-    st.image(backing_preview, use_container_width=True)
+    st.image(white_preview, use_container_width=True)
 
-    st.subheader("7️⃣ White plate incl. underprint preview")
-
-    white_plate_preview = np.full_like(img_rgb_original, 225)
-    white_plate_preview[white_plate_mask_full] = [255, 255, 255]
-    white_plate_preview[transparent_mask_full] = [180, 180, 180]
-
-    st.image(white_plate_preview, use_container_width=True)
-
-    st.subheader("8️⃣ Clean detection preview")
-
-    preview_colors = {
-        "White": [255, 255, 255],
-        "Black": [0, 0, 0],
-        "Blue": [30, 45, 150],
-        "Green": [0, 140, 70],
-        "Red": [200, 30, 40],
-        "Yellow": [255, 210, 0],
-        "Orange": [240, 120, 30],
-        "Purple": [120, 60, 160],
-        "Pink": [230, 60, 140],
-        "Cyan / Blue-Green": [0, 170, 180],
-    }
+    st.subheader("8️⃣ Clean ink assignment preview")
 
     clean_preview = np.full_like(img_rgb_original, 230)
 
-    for color_name, mask in final_masks.items():
+    preview_palette = [
+        [255, 255, 255],
+        [0, 0, 0],
+        [140, 140, 140],
+        [30, 45, 150],
+        [0, 140, 70],
+        [200, 30, 40],
+        [255, 210, 0],
+        [240, 120, 30],
+        [120, 60, 160],
+        [230, 60, 140],
+        [0, 170, 180],
+    ]
+
+    for i, (ink, mask) in enumerate(assigned_masks.items()):
         mask_full = cv2.resize(
             mask.astype(np.uint8),
             (img_rgb_original.shape[1], img_rgb_original.shape[0]),
             interpolation=cv2.INTER_NEAREST,
         ).astype(bool)
 
-        clean_preview[mask_full] = preview_colors[color_name]
+        clean_preview[mask_full] = preview_palette[i % len(preview_palette)]
 
-    clean_preview[transparent_mask_full] = [180, 180, 180]
+    clean_preview[transparent_full] = [180, 180, 180]
 
     st.image(clean_preview, use_container_width=True)
 
 st.info(
-    "Check the white plate preview. If it matches the areas where the white cylinder prints, "
-    "use that white plate % for white ink consumption."
+    "For highest accuracy: Manual mode is best when you know the real print inks. "
+    "Auto-detect is useful when staff does not know how many main colors are in the artwork."
 )
