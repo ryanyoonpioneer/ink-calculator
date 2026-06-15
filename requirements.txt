@@ -1,5 +1,6 @@
 streamlit
+pandas
 numpy
 opencv-python-headless
-pandas
-scikit-image
+Pillow
+streamlit-image-coordinates
