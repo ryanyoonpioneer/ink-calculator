@@ -1,6 +1,6 @@
 streamlit
-pandas
 numpy
 opencv-python-headless
-Pillow
+pandas
+pillow
 streamlit-image-coordinates
